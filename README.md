@@ -10,6 +10,9 @@ $ git log --oneline | head -n 3
 2bc42667 Merge branch 'bugfix/constrain_cryptography_v3.3' into 'release/v3.3'
 4cab385e Tools: Constrain the cryptography package for avoiding breaking changes
 6c438bce Merge branch 'bugfix/queue_arith_overflow_v3.3' into 'release/v3.3'
+
+Toolchain version: crosstool-ng-1.22.0-100-ge567ec7b
+Compiler version: 5.2.0
 ```
 
 ## Build and Flash
