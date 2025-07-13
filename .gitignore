@@ -53,3 +53,11 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# vscode files
+.vscode/
+*.code-workspace
+
+# esp8266 build
+build/
+sdkconfig.old
