@@ -35,10 +35,13 @@
 #include "spiffs.h"
 #include "simple_ctrl.h"
 #include "wifi.h"
+#include "ir_ctrl.h"
 
 static const char *TAG = "APP-MAIN";
 
 #define KEYBOARD_GPIO_PIN		GPIO_NUM_0
+#define IR_RX_GPIO_PIN			GPIO_NUM_12
+#define IR_TX_GPIO_PIN			GPIO_NUM_14
 
 static bool config_mode;
 
@@ -93,9 +96,26 @@ static bool app_event_notify_callback(struct event_bus_msg *msg)
 			config_mode = true;
 		}
 		break;
+	case EVENT_BUS_IR_RX:
+		ESP_LOGI(TAG, "IR received");
+		break;
 	}
 
 	return false;
+}
+
+static void app_ir_rx_callback(uint16_t *data, uint16_t len)
+{
+	uint16_t index;
+
+	ESP_LOGI(TAG, "IR data len: %u", len);
+
+	for (index = 0; index < len; index++)
+		printf("%u ", data[index]);
+	printf("\n");
+	fflush(stdout);
+
+	ir_ctrl_tx_send_data(data, len);
 }
 
 void app_main(void)
@@ -107,6 +127,9 @@ void app_main(void)
 	app_show_info();
 	ESP_ERROR_CHECK(nvs_flash_init());
 
+	/* install gpio isr service */
+	ESP_ERROR_CHECK(gpio_install_isr_service(0));
+
 	spiffs_init();
 
 	/* Event bus */
@@ -114,8 +137,11 @@ void app_main(void)
 	event_bus_register(app_event_notify_callback);
 	event_bus_send(&msg);
 
-	/* KEYBOARD */
+	/* Keyboard */
 	keyboard_init(keyboard_gpios, sizeof(keyboard_gpios));
+
+	/* IR ctrl */
+	ir_ctrl_init(IR_RX_GPIO_PIN, IR_TX_GPIO_PIN, app_ir_rx_callback);
 
 	/* Wifi */
 	wifi_init();
