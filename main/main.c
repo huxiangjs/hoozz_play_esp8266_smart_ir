@@ -36,12 +36,18 @@
 #include "simple_ctrl.h"
 #include "wifi.h"
 #include "ir_ctrl.h"
+#include "gpio_led.h"
 
 static const char *TAG = "APP-MAIN";
 
 #define KEYBOARD_GPIO_PIN		GPIO_NUM_0
 #define IR_RX_GPIO_PIN			GPIO_NUM_12
 #define IR_TX_GPIO_PIN			GPIO_NUM_14
+#define LED_GREEN_GPIO_PIN		GPIO_NUM_4
+#define LED_RED_GPIO_PIN		GPIO_NUM_5
+
+#define LED_GREEN_BRIGHTNESS_MAX	32
+#define LED_RED_BRIGHTNESS_MAX		255
 
 static bool config_mode;
 
@@ -75,6 +81,16 @@ static bool app_event_notify_callback(struct event_bus_msg *msg)
 {
 	switch (msg->type) {
 	case EVENT_BUS_STARTUP:
+		gpio_led_set_green_brightness(0);
+		gpio_led_set_red_brightness(LED_RED_BRIGHTNESS_MAX);
+		break;
+	case EVENT_BUS_WIFI_CONNECTED:
+		gpio_led_set_red_brightness(0);
+		gpio_led_set_green_brightness(LED_GREEN_BRIGHTNESS_MAX);
+		break;
+	case EVENT_BUS_WIFI_DISCONNECTED:
+		gpio_led_set_green_brightness(0);
+		gpio_led_set_red_brightness(LED_RED_BRIGHTNESS_MAX);
 		break;
 	case EVENT_BUS_START_SMART_CONFIG:
 		break;
@@ -115,7 +131,11 @@ static void app_ir_rx_callback(uint16_t *data, uint16_t len)
 	printf("\n");
 	fflush(stdout);
 
+	gpio_led_set_green_brightness(0);
+	gpio_led_set_red_brightness(LED_RED_BRIGHTNESS_MAX);
 	ir_ctrl_tx_send_data(data, len);
+	gpio_led_set_red_brightness(0);
+	gpio_led_set_green_brightness(LED_GREEN_BRIGHTNESS_MAX);
 }
 
 void app_main(void)
@@ -125,6 +145,11 @@ void app_main(void)
 
 	print_chip_info();
 	app_show_info();
+
+	/* GPIO LED */
+	gpio_led_init(LED_RED_GPIO_PIN, LED_GREEN_GPIO_PIN);
+
+	/* NVS init */
 	ESP_ERROR_CHECK(nvs_flash_init());
 
 	/* install gpio isr service */
