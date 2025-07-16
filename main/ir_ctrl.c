@@ -175,7 +175,7 @@ static void ir_rx_task(void *arg)
 	while (1) {
 		if (xQueueReceive(detail_queue, &detail, xTicksToWait)) {
 			if (xTicksToWait == portMAX_DELAY) {	// start
-				xTicksToWait = 60 / portTICK_PERIOD_MS;
+				xTicksToWait = pdMS_TO_TICKS(60);
 				ir_rx_len = 0;
 				drop = false;
 			} else if (ir_rx_len < ARRAY_SIZE(ir_rx_buff)) { // append
