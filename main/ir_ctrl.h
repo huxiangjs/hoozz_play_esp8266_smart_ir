@@ -31,6 +31,8 @@
 extern "C" {
 #endif
 
+#define RX_BUFF_SIZE_MAX		512
+
 typedef void (*ir_rx_callback)(uint16_t *data, uint16_t len);
 
 void ir_ctrl_init(uint8_t rx_gpio, uint8_t tx_gpio, ir_rx_callback cb);

@@ -54,12 +54,10 @@ static const char *TAG = "IR-CTRL";
 #define portYIELD_FROM_ISR portYIELD
 #endif
 
-#define RX_BUFF_SIZE_MAX		512
-
 static QueueHandle_t detail_queue;
 static uint8_t ir_rx_gpio;
 static uint16_t ir_rx_buff[RX_BUFF_SIZE_MAX];
-static size_t ir_rx_len = 0;
+static uint16_t ir_rx_len = 0;
 static ir_rx_callback ir_rx_cb;
 
 static TaskHandle_t waiting_task;
