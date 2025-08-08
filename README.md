@@ -15,12 +15,19 @@ Toolchain version: crosstool-ng-1.22.0-100-ge567ec7b
 Compiler version: 5.2.0
 ```
 
+## Pull source code
+```shell
+git clone https://github.com/huxiangjs/hoozz_play_esp8266_smart_ir.git --recurse-submodules
+```
+
 ## Build and Flash
 
 * first step: open the sdkconfig file, modify `CONFIG_ESPTOOLPY_PORT` to your serial.
 
 ```shell
+cd hoozz_play_esp8266_smart_ir/MCU
 make -j$(nproc)
 make flash
-make monitor
+# make monitor
 ```
+
