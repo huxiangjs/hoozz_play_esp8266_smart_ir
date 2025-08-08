@@ -5,7 +5,7 @@
 
 # COMPONENT_SRCDIRS :=
 
-COMPONENT_ADD_INCLUDEDIRS := . esp32-common/
+COMPONENT_ADD_INCLUDEDIRS := . esp32-common/ esp8266-common/
 
 # COMPONENT_SRCS +=
 

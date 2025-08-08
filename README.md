@@ -22,6 +22,5 @@ Compiler version: 5.2.0
 ```shell
 make -j$(nproc)
 make flash
-# reset later
 make monitor
 ```
