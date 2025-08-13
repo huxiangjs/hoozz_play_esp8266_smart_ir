@@ -28,6 +28,6 @@ git clone https://github.com/huxiangjs/hoozz_play_esp8266_smart_ir.git --recurse
 cd hoozz_play_esp8266_smart_ir/MCU
 make -j$(nproc)
 make flash
-# make monitor
+make monitor    # Monitor UART log output
 ```
 
