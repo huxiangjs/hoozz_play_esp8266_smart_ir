@@ -514,8 +514,7 @@ void app_main(void)
 	wifi_init();
 
 	/* Network ctrl */
-	simple_ctrl_init();
-	simple_ctrl_set_name("SMART IR");
+	simple_ctrl_init("SMART IR");
 	simple_ctrl_set_class_id(CLASS_ID_SMART_IR);
 	simple_ctrl_request_register(app_ir_request);
 	wifi_connect();
