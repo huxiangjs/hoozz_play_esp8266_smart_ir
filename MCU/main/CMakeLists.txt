@@ -1,2 +1,11 @@
 idf_component_register(SRCS "main.c"
-                    INCLUDE_DIRS "")
+                       "esp32-common/crypto.c"
+                       "esp32-common/tiny-AES-c/aes.c"
+                       "esp32-common/event_bus.c"
+                       "esp32-common/keyboard.c"
+                       "esp32-common/simple_ctrl.c"
+                       "esp32-common/store.c"
+                       "esp8266-common/gpio_led.c"
+                       "esp8266-common/ir_ctrl.c"
+                       "esp8266-common/wifi.c"
+                       INCLUDE_DIRS "esp32-common" "esp8266-common")
