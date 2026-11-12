@@ -17,6 +17,7 @@ COMPONENT_OBJS := \
 	esp32-common/keyboard.o \
 	esp32-common/simple_ctrl.o \
 	esp32-common/store.o \
+	esp32-common/tcp_crypto.o \
 	esp8266-common/gpio_led.o \
 	esp8266-common/ir_ctrl.o \
 	esp8266-common/wifi.o

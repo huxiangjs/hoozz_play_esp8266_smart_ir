@@ -23,6 +23,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -46,6 +47,8 @@
 #include "wifi.h"
 #include "ir_ctrl.h"
 #include "gpio_led.h"
+#include "tcp_crypto.h"
+#include "os.h"
 
 static const char *TAG = "APP-MAIN";
 
@@ -69,6 +72,10 @@ static const char *TAG = "APP-MAIN";
 #define IR_CMD_SAVE			0x03
 #define IR_CMD_REMOVE			0x04
 #define IR_CMD_TX_SEND			0x05
+#define IR_CMD_OPEN_TUNNEL		0x06
+#define IR_CMD_CLOSE_TUNNEL		0x07
+#define IR_CMD_DOWNLOAD_KEY		0x08
+#define IR_CMD_UPLOAD_KEY		0x09
 
 #define IR_NOTIFY_TYPE_RX		0x00
 #define IR_NOTIFY_TYPE_KEY		0x01
@@ -80,6 +87,17 @@ static const char *TAG = "APP-MAIN";
 
 #define IR_KEY_NUM_MAX			100
 #define IR_KEY_NAME_LEN_MAX		100
+
+/*
+ * Maximum length of a key file name ("IRDATA-" + name).
+ *
+ * The SPIFFS in this SDK rejects names longer than
+ * CONFIG_SPIFFS_OBJ_NAME_LEN - 1, and the VFS passes the object
+ * path with a leading '/', so a full-length name needs
+ * 1 + IR_DATA_PREFIX_LEN + IR_KEY_NAME_LEN_MAX bytes; the SPIFFS
+ * config in sdkconfig is set to fit that.
+ */
+#define IR_KEY_FILE_NAME_LEN_MAX	(IR_DATA_PREFIX_LEN + IR_KEY_NAME_LEN_MAX)
 
 static bool config_mode;
 static QueueHandle_t led_queue;
@@ -162,8 +180,372 @@ static void app_led_set_step(char step)
 	xQueueSend(led_queue, (void *)&step, (TickType_t)0);
 }
 
+/* Key transfer via the encrypted tunnel */
+
+#define TUNNEL_KEY_DATA_MAX		(RX_BUFF_SIZE_MAX * sizeof(uint16_t))
+/* Key data is streamed to/from the file in tunnel messages of at most
+ * this many bytes, so no full-size buffer is needed. 256 matches the
+ * SPIFFS page size (one fwrite per page) and halves the frame count vs
+ * 128, cutting per-message framing overhead */
+#define TUNNEL_KEY_CHUNK		256
+/* Whole-frame I/O buffer for the tunnel crypto layer, chosen here at
+ * session start: a frame is 2 (length) + 16 (IV) + ciphertext, and the
+ * buffer must fit the largest message (1024 bytes of headroom over the
+ * 256-byte key chunk): 2 + 16 + 1024 = 1042, 16-aligned gives 1056.
+ * Each connection holds two of these (one per direction) */
+#define TUNNEL_IO_BUF_SIZE		(2 + 16 + 1024 + 15) & ~15
+
+/*
+ * Tunnel session policy (app level).
+ *
+ * The fixed port avoids the control (54542) and discovery (54543) ports.
+ * The idle timeout guards against the app crashing and holding the
+ * tunnel forever.
+ */
+#define TUNNEL_PORT			54550
+#define TUNNEL_IO_TIMEOUT_MS		5000
+#define TUNNEL_IDLE_TIMEOUT_MS		5000
+#define TUNNEL_LOOP_TIMEOUT_MS		100
+
+#define TUNNEL_SESSION_STACK		4096
+#define TUNNEL_SESSION_MAX_OPS		2
+
+enum tunnel_op {
+	TUNNEL_OP_NONE,
+	TUNNEL_OP_CLOSE,
+	TUNNEL_OP_DOWNLOAD,
+	TUNNEL_OP_UPLOAD,
+};
+
+/* An operation queued to the tunnel session task */
+struct tunnel_op_msg {
+	int op;
+	char name[IR_KEY_NAME_LEN_MAX + 1];
+	uint32_t size;
+};
+
+/*
+ * One tunnel session: a single client on the encrypted transport,
+ * driven by its own task. The session task is the only thread that
+ * touches the transport, other threads only queue operations.
+ */
+struct tunnel_session {
+	/* The listening socket and the current (authenticated) client,
+	 * both owned by the session task */
+	int listen_fd;
+	struct tcp_crypto *client;
+	uint8_t key[TCP_CRYPTO_KEY_LENGTH];
+	QueueHandle_t op_queue;
+	TaskHandle_t task;
+	/* The task sets finished when it has closed the transport and
+	 * cleaned up (no use-after-free) */
+	volatile bool finished;
+	uint32_t last_active_ms;
+};
+
+/* The current (or recently dead) tunnel session */
+static struct tunnel_session *tunnel;
+
+/* Get the size (bytes) of a stored key, <0 if it does not exist */
+static int app_key_get_size(const char *name, uint32_t *size)
+{
+	char file_path[SPIFFS_ROOT_PATH_LEN + 1 + IR_DATA_PREFIX_LEN + IR_KEY_NAME_LEN_MAX + 1];
+	struct stat st;
+
+	/* stat() reads the size from the SPIFFS index, no data access */
+	snprintf(file_path, sizeof(file_path), SPIFFS_ROOT_PATH "/" IR_DATA_PREFIX "%s", name);
+	if (stat(file_path, &st) != 0)
+		return -1;
+	*size = (uint32_t)st.st_size;
+	return 0;
+}
+
+/*
+ * Send the key data of `op` to the tunnel client (download). The data
+ * is streamed from the file in TUNNEL_KEY_CHUNK-byte tunnel messages,
+ * so no full-size buffer is needed.
+ */
+static int app_tunnel_do_download(struct tcp_crypto *tc,
+		const struct tunnel_op_msg *op)
+{
+	char file_path[SPIFFS_ROOT_PATH_LEN + 1 + IR_DATA_PREFIX_LEN + IR_KEY_NAME_LEN_MAX + 1];
+	uint8_t chunk[TUNNEL_KEY_CHUNK];
+	FILE *fp;
+	uint32_t sent = 0;
+	uint32_t want;
+	size_t len;
+
+	snprintf(file_path, sizeof(file_path), SPIFFS_ROOT_PATH "/" IR_DATA_PREFIX "%s", op->name);
+	fp = fopen(file_path, "rb");
+	if (!fp) {
+		ESP_LOGE(TAG, "Download failed (Open)");
+		return -1;
+	}
+	while (sent < op->size) {
+		want = op->size - sent;
+		if (want > TUNNEL_KEY_CHUNK)
+			want = TUNNEL_KEY_CHUNK;
+		len = fread(chunk, 1, want, fp);
+		if (len == 0) {
+			ESP_LOGE(TAG, "Download failed (Read, %u/%u)",
+				 (unsigned int)sent, (unsigned int)op->size);
+			fclose(fp);
+			return -1;
+		}
+		if (tcp_crypto_send(tc, chunk, (int)len,
+				TUNNEL_IO_TIMEOUT_MS) < 0) {
+			ESP_LOGE(TAG, "Download failed (Send)");
+			fclose(fp);
+			return -1;
+		}
+		sent += (uint32_t)len;
+	}
+	fclose(fp);
+
+	ESP_LOGI(TAG, "Key [%s] data sent (%ub)", op->name, (unsigned int)op->size);
+	return 0;
+}
+
+/*
+ * Save the key data received from the tunnel client (upload). The data
+ * arrives as TUNNEL_KEY_CHUNK-byte tunnel messages and is written to the
+ * file as it comes in, so no full-size buffer is needed.
+ */
+static void app_tunnel_do_upload(struct tcp_crypto *tc,
+		const struct tunnel_op_msg *op)
+{
+	char file_path[SPIFFS_ROOT_PATH_LEN + 1 + IR_DATA_PREFIX_LEN + IR_KEY_NAME_LEN_MAX + 1];
+	uint8_t chunk[TUNNEL_KEY_CHUNK];
+	FILE *fp;
+	uint32_t received = 0;
+	uint32_t want;
+	size_t len;
+	int size;
+
+	snprintf(file_path, sizeof(file_path), SPIFFS_ROOT_PATH "/" IR_DATA_PREFIX "%s", op->name);
+	fp = fopen(file_path, "wb");
+	if (!fp) {
+		ESP_LOGE(TAG, "Upload failed (Open)");
+		return;
+	}
+	while (received < op->size) {
+		want = op->size - received;
+		if (want > TUNNEL_KEY_CHUNK)
+			want = TUNNEL_KEY_CHUNK;
+
+		size = tcp_crypto_recv(tc, chunk, (int)want,
+				TUNNEL_IO_TIMEOUT_MS);
+		if (size <= 0) {
+			ESP_LOGE(TAG, "Upload failed (Recv, %u/%u)",
+				 (unsigned int)received, (unsigned int)op->size);
+			break;
+		}
+		len = fwrite(chunk, 1, (size_t)size, fp);
+		if (len != (size_t)size) {
+			ESP_LOGE(TAG, "Upload failed (Write)");
+			break;
+		}
+		received += (uint32_t)size;
+	}
+	fclose(fp);
+	if (received != op->size) {
+		remove(file_path);
+		return;
+	}
+
+	ESP_LOGI(TAG, "Key [%s] uploaded (%ub)", op->name, (unsigned int)op->size);
+	/* Re-build cache */
+	app_ir_key_cache_build();
+	/* Notify all connections that the key has changed */
+	app_notify_key_changed();
+}
+
+/*
+ * The tunnel session task: the only thread touching the session's
+ * connections. It accepts clients on the listening socket (each one is
+ * authenticated by tcp_crypto_accept), then serves operations from the
+ * queue (CLOSE / DOWNLOAD / UPLOAD).
+ */
+static void tunnel_session_task(void *arg)
+{
+	struct tunnel_session *s = arg;
+	struct tunnel_op_msg op;
+	uint32_t idle;
+
+	while (true) {
+		/* A dead client (dropped after a failed transfer) is
+		 * reclaimed before waiting for the next one */
+		if (s->client && !tcp_crypto_is_connected(s->client)) {
+			tcp_crypto_close(s->client);
+			s->client = NULL;
+		}
+
+		/* Wait until the client is connected. accept() retries
+		 * internally until the remaining idle time is used up (it
+		 * re-accepts after a failed handshake), so no client within
+		 * the idle timeout means the session is over. */
+		while (!s->client) {
+			idle = os_get_time_ms() - s->last_active_ms;
+			if (idle >= TUNNEL_IDLE_TIMEOUT_MS)
+				goto done;
+			s->client = tcp_crypto_accept(s->listen_fd, s->key,
+						TUNNEL_IO_BUF_SIZE,
+						TUNNEL_IDLE_TIMEOUT_MS - idle);
+			if (s->client) {
+				ESP_LOGI(TAG, "Tunnel client connected (port %d)",
+					 TUNNEL_PORT);
+				s->last_active_ms = os_get_time_ms();
+			}
+		}
+
+		/* Wait for the next operation */
+		if (xQueueReceive(s->op_queue, &op,
+				pdMS_TO_TICKS(TUNNEL_LOOP_TIMEOUT_MS)) != pdPASS) {
+			/* Idle timeout */
+			if (os_get_time_ms() - s->last_active_ms > TUNNEL_IDLE_TIMEOUT_MS)
+				goto done;
+			/* Data on the stream without a matching operation, or a
+			 * closed peer, is not recoverable */
+			if (tcp_crypto_peek(s->client) > 0) {
+				ESP_LOGW(TAG, "Unexpected tunnel data or peer closed, closing");
+				goto done;
+			}
+			continue;
+		}
+
+		switch (op.op) {
+		case TUNNEL_OP_CLOSE:
+			goto done;
+		case TUNNEL_OP_DOWNLOAD:
+			/* A failed download cannot send the promised data,
+			 * end the session */
+			if (app_tunnel_do_download(s->client, &op) < 0)
+				goto done;
+			break;
+		case TUNNEL_OP_UPLOAD:
+			/* Do not end the session on failure, the client can
+			 * retry */
+			app_tunnel_do_upload(s->client, &op);
+			break;
+		default:
+			continue;
+		}
+		s->last_active_ms = os_get_time_ms();
+
+		/* Out-of-band data (or a closed peer) is not recoverable,
+		 * unless the next operation is already queued and owns the
+		 * stream */
+		if (uxQueueMessagesWaiting(s->op_queue) == 0 &&
+		    tcp_crypto_peek(s->client) > 0) {
+			ESP_LOGW(TAG, "Unexpected tunnel data or peer closed, closing");
+			goto done;
+		}
+	}
+
+done:
+	if (s->client)
+		tcp_crypto_close(s->client);
+	close(s->listen_fd);
+	ESP_LOGI(TAG, "Tunnel session ended (port %d)", TUNNEL_PORT);
+	s->finished = true;
+	vTaskDelete(NULL);
+}
+
+/*
+ * Open the tunnel listening socket on the fixed port.
+ *
+ * Returns the fd on success, <0 on failure.
+ */
+static int tunnel_open_listen_socket(void)
+{
+	struct sockaddr_in address;
+	int operate = 1;
+	int fd;
+
+	fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) {
+		ESP_LOGE(TAG, "Socket failed: %d", errno);
+		return -1;
+	}
+	/* Allow binding a port held in TIME_WAIT by a previous session */
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &operate, sizeof(operate));
+	memset(&address, 0, sizeof(address));
+	address.sin_family = AF_INET;
+	address.sin_addr.s_addr = INADDR_ANY;
+	address.sin_port = htons(TUNNEL_PORT);
+	if (bind(fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+		ESP_LOGE(TAG, "Bind port %d failed: %d", TUNNEL_PORT, errno);
+		close(fd);
+		return -1;
+	}
+	if (listen(fd, 1) < 0) {
+		ESP_LOGE(TAG, "Listen failed: %d", errno);
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+/* Create a new tunnel session and start its task */
+static struct tunnel_session *tunnel_session_open(void)
+{
+	struct tunnel_session *s;
+
+	s = (struct tunnel_session *)malloc(sizeof(*s));
+	if (!s) {
+		ESP_LOGE(TAG, "Tunnel session malloc failed");
+		return NULL;
+	}
+	memset(s, 0, sizeof(*s));
+	s->listen_fd = -1;
+	s->client = NULL;
+
+	s->op_queue = xQueueCreate(TUNNEL_SESSION_MAX_OPS,
+			sizeof(struct tunnel_op_msg));
+	if (!s->op_queue) {
+		ESP_LOGE(TAG, "Tunnel queue create failed");
+		free(s);
+		return NULL;
+	}
+
+	/* Generate the tunnel key and open the listening socket */
+	os_fill_random(s->key, TCP_CRYPTO_KEY_LENGTH);
+	s->listen_fd = tunnel_open_listen_socket();
+	if (s->listen_fd < 0) {
+		ESP_LOGE(TAG, "Tunnel listen socket failed");
+		vQueueDelete(s->op_queue);
+		free(s);
+		return NULL;
+	}
+	s->last_active_ms = os_get_time_ms();
+
+	if (xTaskCreate(tunnel_session_task, "tunnel_session",
+			TUNNEL_SESSION_STACK, s, tskIDLE_PRIORITY + 2,
+			&s->task) != pdPASS) {
+		ESP_LOGE(TAG, "Tunnel task create failed");
+		close(s->listen_fd);
+		vQueueDelete(s->op_queue);
+		free(s);
+		return NULL;
+	}
+
+	ESP_LOGI(TAG, "Tunnel session started (port %d)", TUNNEL_PORT);
+	return s;
+}
+
+/* Free a dead session (the task has set finished and exited, the task
+ * already closed the client and the listening socket) */
+static void tunnel_session_free(struct tunnel_session *s)
+{
+	vQueueDelete(s->op_queue);
+	free(s);
+}
+
 static int app_ir_request(char *buffer, int buf_offs, int vaild_size, int buff_size)
 {
+	/* The ctrl body task is the only caller of this handler; keep `op`
+	 * static to save the task's small (3000 bytes) stack */
+	static struct tunnel_op_msg op;
 	uint32_t count;
 	size_t len;
 	FILE *fp;
@@ -233,7 +615,8 @@ static int app_ir_request(char *buffer, int buf_offs, int vaild_size, int buff_s
 	case IR_CMD_SAVE:		/* Save the received IR key data */
 		if (vaild_size < 1 + 4)
 			goto lllegal_err;
-		if (vaild_size - 1 - 4 > IR_KEY_NAME_LEN_MAX) {
+		if (vaild_size - 1 - 4 > IR_KEY_NAME_LEN_MAX ||
+		    IR_DATA_PREFIX_LEN + (vaild_size - 1 - 4) > IR_KEY_FILE_NAME_LEN_MAX) {
 			buffer[buf_offs + 1] = IR_RESULT_FAIL;
 			ESP_LOGE(TAG, "Save failed (The name is too long)");
 			return 2;
@@ -327,6 +710,129 @@ static int app_ir_request(char *buffer, int buf_offs, int vaild_size, int buff_s
 			buffer[buf_offs + 1] = IR_RESULT_FAIL;
 			ESP_LOGE(TAG, "IR send failed (Open)");
 		}
+		return 2;
+	case IR_CMD_OPEN_TUNNEL:		/* Open the tunnel */
+		/* Response: [cmd, result, port(2bytes), key(16bytes)] */
+		if (vaild_size != 1)
+			goto lllegal_err;
+		if (buff_size - buf_offs < 4 + TCP_CRYPTO_KEY_LENGTH)
+			goto nomem_err;
+
+		if (tunnel && !tunnel->finished) {
+			/*
+			 * Single user: reject if a tunnel is already open
+			 * (a closing one counts as open too). The old
+			 * session ends on its own (CLOSE operation or idle
+			 * timeout) and the next OPEN reclaims it.
+			 */
+			buffer[buf_offs + 1] = IR_RESULT_FAIL;
+			ESP_LOGE(TAG, "Open failed (Tunnel already open)");
+			return 2;
+		}
+		if (tunnel) {
+			/* Reclaim the dead session */
+			tunnel_session_free(tunnel);
+			tunnel = NULL;
+		}
+
+		tunnel = tunnel_session_open();
+		if (!tunnel) {
+			buffer[buf_offs + 1] = IR_RESULT_FAIL;
+			ESP_LOGE(TAG, "Open tunnel failed");
+			return 2;
+		}
+
+		buffer[buf_offs + 1] = IR_RESULT_OK;
+		buffer[buf_offs + 2] = TUNNEL_PORT & 0xff;
+		buffer[buf_offs + 3] = (TUNNEL_PORT >> 8) & 0xff;
+		memcpy(buffer + buf_offs + 4, tunnel->key, TCP_CRYPTO_KEY_LENGTH);
+		return 4 + TCP_CRYPTO_KEY_LENGTH;
+	case IR_CMD_CLOSE_TUNNEL:	/* Close the tunnel */
+		if (vaild_size != 1)
+			goto lllegal_err;
+		if (tunnel) {
+			if (tunnel->finished) {
+				/* The session is already dead, reclaim it */
+				tunnel_session_free(tunnel);
+				tunnel = NULL;
+			} else {
+				/* The session task will close the transport */
+				memset(&op, 0, sizeof(op));
+				op.op = TUNNEL_OP_CLOSE;
+				xQueueSend(tunnel->op_queue, &op, (TickType_t)0);
+			}
+		}
+		buffer[buf_offs + 1] = IR_RESULT_OK;
+		return 2;
+	case IR_CMD_DOWNLOAD_KEY:	/* Download a key via the tunnel */
+		/* Request: [cmd, name]
+		 * Response: [cmd, result, size(4bytes)], then the client
+		 * reads the data from the tunnel */
+		if (vaild_size < 2 || vaild_size - 1 > IR_KEY_NAME_LEN_MAX)
+			goto lllegal_err;
+		if (!tunnel || tunnel->finished) {
+			buffer[buf_offs + 1] = IR_RESULT_FAIL;
+			ESP_LOGE(TAG, "Download failed (Tunnel not opened)");
+			return 2;
+		}
+		memset(&op, 0, sizeof(op));
+		op.op = TUNNEL_OP_DOWNLOAD;
+		memcpy(op.name, buffer + buf_offs + 1, vaild_size - 1);
+		/* The key must exist */
+		if (app_key_get_size(op.name, &op.size) != 0 ||
+		    op.size == 0 || op.size > TUNNEL_KEY_DATA_MAX) {
+			buffer[buf_offs + 1] = IR_RESULT_FAIL;
+			ESP_LOGE(TAG, "Download failed (Key not exist)");
+			return 2;
+		}
+		if (buff_size - buf_offs < 6)
+			goto nomem_err;
+		if (xQueueSend(tunnel->op_queue, &op, (TickType_t)0) != pdPASS) {
+			buffer[buf_offs + 1] = IR_RESULT_FAIL;
+			ESP_LOGE(TAG, "Download failed (Busy)");
+			return 2;
+		}
+		buffer[buf_offs + 1] = IR_RESULT_OK;
+		buffer[buf_offs + 2] = op.size & 0xff;
+		buffer[buf_offs + 3] = (op.size >> 8) & 0xff;
+		buffer[buf_offs + 4] = (op.size >> 16) & 0xff;
+		buffer[buf_offs + 5] = (op.size >> 24) & 0xff;
+		return 6;
+	case IR_CMD_UPLOAD_KEY:		/* Upload a key via the tunnel */
+		/* Request: [cmd, size(4bytes), name]
+		 * If the key exists it will be overwritten, otherwise it is
+		 * created. After this response the client sends the key
+		 * data to the tunnel. */
+		if (vaild_size < 1 + 4 + 1 || vaild_size - 1 - 4 > IR_KEY_NAME_LEN_MAX)
+			goto lllegal_err;
+		if (IR_DATA_PREFIX_LEN + (vaild_size - 1 - 4) > IR_KEY_FILE_NAME_LEN_MAX) {
+			buffer[buf_offs + 1] = IR_RESULT_FAIL;
+			ESP_LOGE(TAG, "Upload failed (The name is too long)");
+			return 2;
+		}
+		if (!tunnel || tunnel->finished) {
+			buffer[buf_offs + 1] = IR_RESULT_FAIL;
+			ESP_LOGE(TAG, "Upload failed (Tunnel not opened)");
+			return 2;
+		}
+		memset(&op, 0, sizeof(op));
+		op.op = TUNNEL_OP_UPLOAD;
+		op.size = (buffer[buf_offs + 1] << 0) |
+			(buffer[buf_offs + 2] << 8) |
+			(buffer[buf_offs + 3] << 16) |
+			(buffer[buf_offs + 4] << 24);
+		if (op.size == 0 || op.size > TUNNEL_KEY_DATA_MAX) {
+			buffer[buf_offs + 1] = IR_RESULT_FAIL;
+			ESP_LOGE(TAG, "Upload failed (Size incorrect)");
+			return 2;
+		}
+		memcpy(op.name, buffer + buf_offs + 1 + 4, vaild_size - 1 - 4);
+		if (xQueueSend(tunnel->op_queue, &op, (TickType_t)0) != pdPASS) {
+			buffer[buf_offs + 1] = IR_RESULT_FAIL;
+			ESP_LOGE(TAG, "Upload failed (Busy)");
+			return 2;
+		}
+		buffer[buf_offs + 1] = IR_RESULT_OK;
 		return 2;
 	default:
 		goto lllegal_err;
