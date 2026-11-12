@@ -1,0 +1,132 @@
+name: ESP8266 CI
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    # inputs:
+    #   branch:
+    #     description: 'Branch to build'
+    #     required: true
+    #     default: 'main'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    # Checkout the repository to the GitHub Actions runner
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        path: esp8266-build
+        fetch-depth: 1
+
+    # Get ESP8266-RTOS-SDK
+    - name: Get ESP8266-RTOS-SDK
+      uses: actions/checkout@v4
+      with:
+        repository: espressif/ESP8266_RTOS_SDK
+        ref: release/v3.3
+        fetch-depth: 1
+        path: ESP8266_RTOS_SDK
+
+    # Install gperf
+    - name: Install Gperf
+      run: sudo apt-get install -y gperf
+
+    # Set python version
+    - name: Set Up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    # Cache ESP8266-RTOS-SDK
+    - name: Cache ESP8266-RTOS-SDK
+      id: cache-esp8266-sdk
+      uses: actions/cache@v3
+      with:
+        path: |
+          ESP8266_RTOS_SDK
+          xtensa-lx106-elf
+        key: ${{ runner.os }}-esp8266-sdk-${{ hashFiles('ESP8266_RTOS_SDK/.git/refs/heads/release/v3.3') }}
+        restore-keys: |
+          ${{ runner.os }}-esp8266-sdk-
+
+    # Install ESP8266-RTOS-SDK
+    - name: Install ESP8266-RTOS-SDK
+      if: steps.cache-esp8266-sdk.outputs.cache-hit != 'true'
+      run: |
+        wget https://dl.espressif.com/dl/xtensa-lx106-elf-linux64-1.22.0-100-ge567ec7-5.2.0.tar.gz
+        tar zxf xtensa-lx106-elf-linux64-1.22.0-100-ge567ec7-5.2.0.tar.gz
+
+    # Cache pip dependencies
+    - name: Cache Pip Dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('ESP8266_RTOS_SDK/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    # Run ESP8266 build command
+    - name: Build
+      run: |
+        pip install -r ESP8266_RTOS_SDK/requirements.txt
+        export IDF_PATH=$(pwd)/ESP8266_RTOS_SDK/
+        export PATH=$PATH:$(pwd)/xtensa-lx106-elf/bin
+        cd esp8266-build/MCU/
+        make defconfig
+        make -j$(nproc)
+        project_name=$(cat Makefile | grep PROJECT_NAME | awk -F '=' '{print $2}' | tr -d '\r')
+        cd build
+        zip -r release.zip bootloader/bootloader.bin $project_name.bin partitions.bin
+
+    # Optionally upload the built directory as an artifact of the workflow
+    # - name: Upload Directory Artifact
+    #   uses: actions/upload-artifact@v4
+    #   with:
+    #     name: build-output
+    #     path: esp8266-sensor/MCU/build/
+
+    # Check tag
+    - name: Check If The Event Is A Tag Push
+      id: check_tag_push
+      run: |
+        if [[ $GITHUB_REF == refs/tags/* ]]; then
+          echo "Is tag push"
+          echo "IS_TAG_PUSH=true" >> $GITHUB_OUTPUT
+        else
+          echo "IS_TAG_PUSH=false" >> $GITHUB_OUTPUT
+        fi
+
+    # Create release
+    - name: Create Release
+      if: steps.check_tag_push.outputs.IS_TAG_PUSH == 'true'
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref_name }}
+        release_name: Release ${{ github.ref_name }}
+        draft: false
+        prerelease: false
+
+    # Upload ZIP to release
+    - name: Upload Release Asset
+      if: steps.check_tag_push.outputs.IS_TAG_PUSH == 'true'
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: esp8266-build/MCU/build/release.zip
+        asset_name: ${{ github.event.repository.name }}_${{ github.ref_name }}.zip
+        asset_content_type: application/zip
