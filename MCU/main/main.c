@@ -310,8 +310,10 @@ static int app_tunnel_do_download(struct tcp_crypto *tc,
  * Save the key data received from the tunnel client (upload). The data
  * arrives as TUNNEL_KEY_CHUNK-byte tunnel messages and is written to the
  * file as it comes in, so no full-size buffer is needed.
+ *
+ * Returns 0 on success, -1 on failure (the file is removed then).
  */
-static void app_tunnel_do_upload(struct tcp_crypto *tc,
+static int app_tunnel_do_upload(struct tcp_crypto *tc,
 		const struct tunnel_op_msg *op)
 {
 	char file_path[SPIFFS_ROOT_PATH_LEN + 1 + IR_DATA_PREFIX_LEN + IR_KEY_NAME_LEN_MAX + 1];
@@ -326,7 +328,7 @@ static void app_tunnel_do_upload(struct tcp_crypto *tc,
 	fp = fopen(file_path, "wb");
 	if (!fp) {
 		ESP_LOGE(TAG, "Upload failed (Open)");
-		return;
+		return -1;
 	}
 	while (received < op->size) {
 		want = op->size - received;
@@ -350,7 +352,7 @@ static void app_tunnel_do_upload(struct tcp_crypto *tc,
 	fclose(fp);
 	if (received != op->size) {
 		remove(file_path);
-		return;
+		return -1;
 	}
 
 	ESP_LOGI(TAG, "Key [%s] uploaded (%ub)", op->name, (unsigned int)op->size);
@@ -358,6 +360,8 @@ static void app_tunnel_do_upload(struct tcp_crypto *tc,
 	app_ir_key_cache_build();
 	/* Notify all connections that the key has changed */
 	app_notify_key_changed();
+
+	return 0;
 }
 
 /*
@@ -371,6 +375,7 @@ static void tunnel_session_task(void *arg)
 	struct tunnel_session *s = arg;
 	struct tunnel_op_msg op;
 	uint32_t idle;
+	uint8_t ack;
 
 	while (true) {
 		/* A dead client (dropped after a failed transfer) is
@@ -424,8 +429,13 @@ static void tunnel_session_task(void *arg)
 			break;
 		case TUNNEL_OP_UPLOAD:
 			/* Do not end the session on failure, the client can
-			 * retry */
-			app_tunnel_do_upload(s->client, &op);
+			 * retry. Acknowledge once all the data has been received
+			 * (1 = saved, 0 = failed); the client waits for the ack
+			 * before the next upload, so the operation queue never
+			 * runs ahead of the stream */
+			ack = app_tunnel_do_upload(s->client, &op) == 0 ? 1 : 0;
+			if (tcp_crypto_send(s->client, &ack, 1, TUNNEL_IO_TIMEOUT_MS) < 0)
+				ESP_LOGE(TAG, "Upload ack send failed");
 			break;
 		default:
 			continue;
@@ -530,6 +540,7 @@ static struct tunnel_session *tunnel_session_open(void)
 	}
 
 	ESP_LOGI(TAG, "Tunnel session started (port %d)", TUNNEL_PORT);
+
 	return s;
 }
 
