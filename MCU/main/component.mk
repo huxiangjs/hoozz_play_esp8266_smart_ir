@@ -15,6 +15,8 @@ COMPONENT_OBJS := \
 	esp32-common/tiny-AES-c/aes.o \
 	esp32-common/event_bus.o \
 	esp32-common/keyboard.o \
+	esp32-common/ota.o \
+	esp32-common/ota_flash.o \
 	esp32-common/simple_ctrl.o \
 	esp32-common/store.o \
 	esp32-common/tcp_crypto.o \

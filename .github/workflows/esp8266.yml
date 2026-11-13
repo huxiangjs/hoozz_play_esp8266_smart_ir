@@ -86,14 +86,17 @@ jobs:
         make -j$(nproc)
         project_name=$(cat Makefile | grep PROJECT_NAME | awk -F '=' '{print $2}' | tr -d '\r')
         cd build
-        zip -r release.zip bootloader/bootloader.bin $project_name.bin partitions.bin
+        # All four flash pieces (see the partition table):
+        #   0x0000 bootloader.bin  0x8000 partitions.bin
+        #   0x10000 ota_data_initial.bin  0x12000 <app>.bin
+        zip -r release.zip bootloader/bootloader.bin $project_name.bin partitions.bin ota_data_initial.bin
 
     # Optionally upload the built directory as an artifact of the workflow
     # - name: Upload Directory Artifact
     #   uses: actions/upload-artifact@v4
     #   with:
     #     name: build-output
-    #     path: esp8266-sensor/MCU/build/
+    #     path: esp8266-build/MCU/build/
 
     # Check tag
     - name: Check If The Event Is A Tag Push
