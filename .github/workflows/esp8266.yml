@@ -84,7 +84,7 @@ jobs:
         cd esp8266-build/MCU/
         make defconfig
         make -j$(nproc)
-        project_name=$(cat Makefile | grep PROJECT_NAME | awk -F '=' '{print $2}' | tr -d '\r')
+        project_name=$(cat Makefile | grep PROJECT_NAME | awk -F '=' '{print $2}' | tr -d ' \r')
         cd build
         # All four flash pieces (see the partition table):
         #   0x0000 bootloader.bin  0x8000 partitions.bin
