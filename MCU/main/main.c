@@ -1040,7 +1040,7 @@ void app_main(void)
 	 * validation stores its state there) */
 	simple_ctrl_ota_enable(APP_GIT_SHA APP_GIT_DIRTY, ota_transports,
 			sizeof(ota_transports) / sizeof(ota_transports[0]),
-			&esp_idf_ota_flash);
+			&esp_idf_ota_flash, NULL);
 
 	/* install gpio isr service */
 	ESP_ERROR_CHECK(gpio_install_isr_service(0));
