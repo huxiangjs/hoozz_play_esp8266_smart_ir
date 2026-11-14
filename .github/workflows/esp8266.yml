@@ -89,7 +89,10 @@ jobs:
         # All four flash pieces (see the partition table):
         #   0x0000 bootloader.bin  0x8000 partitions.bin
         #   0x10000 ota_data_initial.bin  0x12000 <app>.bin
-        zip -r release.zip bootloader/bootloader.bin $project_name.bin partitions.bin ota_data_initial.bin
+        # ota_file names the app bin the OTA update flashes (the app reads
+        # it from the release zip to pick the firmware image)
+        echo "$project_name.bin" > ota_file
+        zip -r release.zip bootloader/bootloader.bin $project_name.bin partitions.bin ota_data_initial.bin ota_file
 
     # Optionally upload the built directory as an artifact of the workflow
     # - name: Upload Directory Artifact
